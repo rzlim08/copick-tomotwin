@@ -1,0 +1,19 @@
+[project]
+name = "copick-tomotwin"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "copick-utils",
+    "copick>=0.8.1",
+    "cryoet-data-portal>=4.0.0",
+    "matplotlib>=3.10.1",
+    "mrcfile>=1.5.4",
+    "mysql-connector-python>=9.2.0",
+    "pandas>=2.2.3",
+    "tables>=3.10.2",
+]
+
+[tool.uv.sources]
+copick-utils = { git = "https://github.com/copick/copick-utils.git" }
