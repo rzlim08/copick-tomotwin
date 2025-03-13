@@ -13,6 +13,17 @@ dependencies = [
     "mysql-connector-python>=9.2.0",
     "pandas>=2.2.3",
     "tables>=3.10.2",
+    "tomotwin-cryoet>=0.9.1.2",
+    "torch==2.5.1",
+    "pyarrow>=19.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "coverage",  # testing
+    "pytest", # testing
+    "mypy",  # linting
+    "ruff",  # linting
 ]
 
 [tool.uv.sources]

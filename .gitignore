@@ -11,3 +11,6 @@ wheels/
 
 # Models
 tomotwin_latest.pth
+
+# Outputs 
+output/
