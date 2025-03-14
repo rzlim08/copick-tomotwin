@@ -4,10 +4,8 @@ import pandas as pd  # data processing, CSV file I/O (e.g. pd.read_csv)
 import os
 import copick
 import requests
-import math
-from tomotwin.modules.inference.embedor import (
-    Embedor,
-)
+import time
+import torch
 from tomotwin.modules.inference.argparse_embed_ui import EmbedConfiguration
 from tomotwin.embed_main import make_embeddor, embed_subvolumes
 from tomotwin.modules.inference.boxer import Boxer
@@ -44,6 +42,7 @@ def install():
 
 
 def get_coords(points, voxel_spacing):
+    """Convert points to voxel coordinates"""
     coords = []
 
     for point in points:
@@ -56,102 +55,75 @@ def get_coords(points, voxel_spacing):
         )
     return np.floor(coords).astype(int)
 
+def get_picks(copick_run):
+    """Get picks - catch retry error from CDP"""
+    try: 
+        return copick_run.picks
+    except requests.exceptions.RetryError as retry_err:
+        return None
 
 def get_copick_run_coords(copick_run, voxel_spacing):
+    """Get picks with retry and convert points to voxel coordinates"""
     protein_pick_coords = {}
-    for picks in copick_run.picks:
-        protein_pick_coords[picks.pickable_object_name] = get_coords(
-            picks.points, voxel_spacing
+    for _ in range(3):
+        picks = get_picks(copick_run)
+        if picks is not None:
+            break
+        else:
+            print("Getting picks failed, retrying after 2 seconds")
+            time.sleep(2)
+    else:
+        raise Exception("Getting picks failed")
+
+    for pick in picks:
+        protein_pick_coords[pick.pickable_object_name] = get_coords(
+            pick.points, voxel_spacing
         )
     return protein_pick_coords
 
-
-def create_slices_from_coords(coords, window):
-    boundary = math.ceil(window / 2) - 1
-    slices = []
-    for coord in coords:
-        x, y, z = coord
-        slice_x = slice(x - boundary, x + boundary)
-        slice_y = slice(y - boundary, y + boundary)
-        slice_z = slice(z - boundary, z + boundary)
-        slices.append((slice_x, slice_y, slice_z))
-    return slices
-
-
-def extend_slices(slices, window):
-    boundary = math.ceil(window / 2) - 1
-    extended_slices = []
-    for slice_x, slice_y, slice_z in slices:
-        extended_slices.append(
-            (
-                slice(slice_x.start - boundary, slice_x.stop + boundary),
-                slice(slice_y.start - boundary, slice_y.stop + boundary),
-                slice(slice_z.start - boundary, slice_z.stop + boundary),
-            )
-        )
-    return extended_slices
-
-
-def sliding_window_embedding(
-    tomo: np.array, boxer: Boxer, embedor: Embedor
-) -> np.array:
-    """
-    Embeds the tomogram using a sliding window approach, placing embeddings in an array based on their positions.
-
-    :param tomo: Tomogram as a numpy array.
-    :param boxer: Box provider that generates positions for embedding.
-    :param embedor: Embedor to embed the boxes extracted from the tomogram.
-    :return: A numpy array with embeddings placed according to their positions.
-    """
-    boxes = boxer.box(tomogram=tomo)
-    breakpoint()
-    embeddings = embedor.embed(volume_data=boxes)
-    if embeddings is None:
-        return None
-
-    # Assuming the shape of tomo is Z, Y, X and embeddings are in Z, Y, X, Embed_dim
-    # Initialize an empty array for the embeddings with an additional dimension for the embedding vector
-    embedding_array = np.zeros(
-        tomo.shape + (embeddings.shape[-1],), dtype=embeddings.dtype
-    )
-
-    for i in range(embeddings.shape[0]):
-        pos_z, pos_y, pos_x = boxes.get_localization(i).astype(int)
-        embedding_array[pos_z, pos_y, pos_x, :] = embeddings[i]
-
-    return embedding_array
-
-
 def make_config():
+    """create configuration for tomotwin"""
     model_path = "tomotwin_latest.pth"
     conf = EmbedConfiguration(model_path, None, None, None, 2)
     conf.model_path = model_path
-    conf.batchsize = 35
-    conf.stride = [1, 1, 1]
+    conf.batchsize = 35 # should not be necessary
+    conf.stride = [1, 1, 1] # should not be necessary
     conf.window_size = 37
 
     return conf
 
 
-def process_run(copick_run, voxel_size):
+def process_run(copick_run, voxel_size, embedor, conf):
+    """Process copick run"""
     print(copick_run.name)
-    conf = make_config()
-    embedor = make_embeddor(conf, rank=None, world_size=1)
-
+    
+    # Create run path
     run_path = Path("output") / copick_run.name
     run_path.mkdir(parents=True, exist_ok=True)
+
+    # get run coords
     run_coords = get_copick_run_coords(copick_run, voxel_size)
+
+    # get tomogram at 10.012 voxel size
     tomogram = (
         copick_run.get_voxel_spacing(voxel_size)
         .get_tomograms("wbp", portal_meta_query={"processing": "denoised"})[0]
         .numpy()
     )
+
+    # 
     embeddings = []
     for protein, coords in run_coords.items():
+
+        # create protein path 
         protein_path = run_path / protein
         protein_path.mkdir(exist_ok=True)
+
+        # convert coords to dataframe
         coords_df = pd.DataFrame(coords)
         coords_df.columns = ["X", "Y", "Z"]
+
+        # extract tomogram and save as a `mrc` file
         ExtractReference.extract_and_save(
             tomogram,
             coords_df,
@@ -160,28 +132,53 @@ def process_run(copick_run, voxel_size):
             basename=protein,
             apix=voxel_size,
         )
+
+        # get list of subvolumes
         subvolume_list = list(protein_path.glob("*.mrc"))
-        conf.volumes_path = str(protein_path)
+        if len(subvolume_list) == 0:
+            continue
+
+        # create embedding output directory
         output_path = protein_path / "output"
         output_path.mkdir(exist_ok=True)
+
+        # set confiugration outputs
+        conf.volumes_path = str(protein_path)
         conf.output_path = str(output_path)
+
+        # embed subvolumes
         df = embed_subvolumes(subvolume_list, embedor, conf)
+
+        # concat embeddings
         embeddings.append(df)
+
+        # empty cuda cache
+        torch.cuda.empty_cache()
     
     return pd.concat(embeddings)
 
 
 def main(copick_config_path: str, voxel_size: float):
-    install()
-    copick_root = copick.from_file(copick_config_path)
-    embeddings = []
-    for run in copick_root.runs:
-        df = process_run(run, voxel_size)
-        embeddings.append(df)
+    """main runner function"""
 
-    full_df = pd.concat(embeddings)
-    full_df.to_parquet('embeddings.parquet.gzip',
-              compression='gzip')
+    # download tomotwin model if not present
+    install()
+
+    # set up configs
+    copick_root = copick.from_file(copick_config_path)
+    conf = make_config()
+    embedor = make_embeddor(conf, rank=None, world_size=1)
+
+
+    for run in copick_root.runs:
+        # create run output directory
+        run_path = Path("output") / run.name
+        if run_path.exists():
+            print(f"Run {run.name} exists - skipping")
+            continue
+
+        # process run
+        process_run(run, voxel_size, embedor, conf)
 
 
 if __name__ == "__main__":
